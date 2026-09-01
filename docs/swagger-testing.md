@@ -164,7 +164,56 @@ Expected: **`400 Bad Request`**, `"message"` containing `"not-an-email" is not a
 
 Expected: **`400 Bad Request`**, `"message"` containing `Coupon code must not be blank`. (This is `Coupon`'s own constructor validation, from the domain layer — the API layer doesn't duplicate this check, it just reports whatever the service throws. See `docs/queries.md` and the main README for how validation is layered across this application.)
 
-## 8. Interpreting the response
+### 7f. Create a coupon with a negative redemption limit → `400 Bad Request`
+
+```json
+{
+  "code": "NEGATIVE1",
+  "maxRedemptions": -1
+}
+```
+
+Expected: **`400 Bad Request`**, `"message"` containing `Max redemptions must not be negative`. Same validation source as 7e — `Coupon`'s constructor (see `CouponTest.negativeMaxRedemptions_isRejected`).
+
+### 7g. Redeem with other malformed `redeemedBy` shapes → `400 Bad Request`
+
+`CouponServiceTest` and `CouponControllerTest` both exercise several malformed shapes, not just one — worth trying more than one by hand too. Using the `WINTER5` coupon from 7d, any of these bodies should produce the same `400`:
+
+```json
+{ "redeemedBy": "missing-at-sign.com" }
+```
+```json
+{ "redeemedBy": "double@@example.com" }
+```
+```json
+{ "redeemedBy": "trailing-dot@example." }
+```
+```json
+{ "redeemedBy": "" }
+```
+
+The last one (`""`) fails the same regex check as the others (an empty string has no `@`), so it also comes back `400`, not some other status — there's no separate "blank" rule at the API layer, just the one email-shape check in `CouponService.requireValidRedeemer`.
+
+## 8. Quick-reference cheat sheet
+
+Every scenario above, in one table — copy a request body straight into Swagger UI's "Try it out" textarea.
+
+| # | Endpoint | Request body | Expected status | Key response field |
+|---|---|---|---|---|
+| 6a | `POST /api/coupons` | `{"code":"SUMMER10","maxRedemptions":2}` | `201` | `"exhausted": false` |
+| 6b | `GET /api/coupons/SUMMER10` | — | `200` | `"remainingRedemptions": 2` |
+| 6c | `POST /api/coupons/SUMMER10/redemptions` | `{"redeemedBy":"customer@example.com"}` | `201` (×2, then see 7a) | `"redeemedBy": "customer@example.com"` |
+| 6d | `GET /api/coupons/SUMMER10/redemptions` | — | `200` | JSON array, 2 items |
+| 7a | `POST /api/coupons/SUMMER10/redemptions` (3rd time) | `{"redeemedBy":"customer@example.com"}` | `409` | `"message"` contains `redemption limit` |
+| 7b | `POST /api/coupons` (duplicate) | `{"code":"SUMMER10","maxRedemptions":2}` | `409` | `"message"` contains `already exists` |
+| 7c | `GET /api/coupons/DOES-NOT-EXIST` | — | `404` | `"message"` contains `No coupon found` |
+| 7d/7g | `POST /api/coupons/WINTER5/redemptions` | `{"redeemedBy":"not-an-email"}` (or any variant in 7g) | `400` | `"message"` contains `not a valid redeemer` |
+| 7e | `POST /api/coupons` | `{"code":"","maxRedemptions":5}` | `400` | `"message"` contains `must not be blank` |
+| 7f | `POST /api/coupons` | `{"code":"NEGATIVE1","maxRedemptions":-1}` | `400` | `"message"` contains `must not be negative` |
+
+Remember 7d/7g need a coupon that exists and still has redemptions left — create `WINTER5` (`{"code":"WINTER5","maxRedemptions":5}`, `201`) first if you haven't already.
+
+## 9. Interpreting the response
 
 - **2xx** (`200`, `201`) — the request succeeded; the body is the DTO described in the tables above (`CouponResponse`, `RedemptionResponse`, or a JSON array of one of them).
 - **4xx** (`400`, `404`, `409`) — the request itself was well-formed HTTP, but something about its content was rejected; the body is always an `ErrorResponse` (see §7). `status` in the body always matches the actual HTTP status code of the response.
