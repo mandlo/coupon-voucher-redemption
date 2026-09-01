@@ -1,0 +1,26 @@
+spring:
+  application:
+    name: coupon-voucher-redemption
+  datasource:
+    url: jdbc:postgresql://localhost:5432/coupon_redemption
+    username: ${DB_USERNAME:coupon_redemption}
+    password: ${DB_PASSWORD:coupon_redemption}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        format_sql: true
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+  api-docs:
+    path: /v3/api-docs
+
+server:
+  port: 8080
