@@ -21,11 +21,32 @@ import java.util.Objects;
  * this entity (validation, equality) exists only to make that method safe
  * to call and easy to test.
  */
+// @NamedQuery is @Repeatable (Jakarta Persistence 2.2+), so multiple named
+// queries can be declared directly on the entity without a wrapping
+// @NamedQueries. Both are plain JPQL: they query Java fields
+// (redemptionCount, maxRedemptions), not database columns, and Hibernate
+// translates them to whatever SQL the configured dialect needs.
 @Entity
 @Table(name = "coupons")
 @NamedQuery(
+        // Coupons with nothing left to give: the running count has caught
+        // up to (or, if data was ever written outside redeem(), passed) the
+        // limit. Spring Data resolves this by matching the repository
+        // method name findExhausted() to "Coupon.findExhausted" exactly -
+        // no @Query annotation needed on the method at all.
         name = "Coupon.findExhausted",
         query = "SELECT c FROM Coupon c WHERE c.redemptionCount >= c.maxRedemptions"
+)
+@NamedQuery(
+        // Coupons that still work, but have :threshold or fewer redemptions
+        // left - the query an ops dashboard or alert would run to catch a
+        // popular coupon about to run out before customers start hitting
+        // CouponExhaustedException. "maxRedemptions - redemptionCount" is
+        // ordinary arithmetic on two entity fields, which is exactly the
+        // kind of expression JPQL was designed to read naturally.
+        name = "Coupon.findNearExhaustion",
+        query = "SELECT c FROM Coupon c WHERE (c.maxRedemptions - c.redemptionCount) <= :threshold "
+                + "AND c.maxRedemptions > 0 ORDER BY (c.maxRedemptions - c.redemptionCount) ASC"
 )
 public class Coupon {
 

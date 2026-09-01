@@ -15,6 +15,8 @@ That's more state to keep straight across a test than a plain create/read/update
 
 ## Domain model
 
+See [`docs/erd.md`](docs/erd.md) for the full entity-relationship diagram and table-by-table notes, and [`docs/uml.md`](docs/uml.md) for the class diagram and repository interfaces.
+
 Two tables:
 
 - **`coupons`** — `code` (unique), `max_redemptions` (the limit, "N"), `redemption_count` (the running total, starts at 0).
@@ -48,16 +50,19 @@ So even if some future code path forgot to call `Coupon.redeem()` and tried to w
 
 ### Repositories (`repository/`)
 
+See [`docs/queries.md`](docs/queries.md) for a full walkthrough of every query below — what it does, why it needed the mechanism it uses, and how Spring Data resolves it. Short version:
+
 `CouponRepository` demonstrates three query techniques side by side, on purpose, so they're easy to compare:
 
 1. **Derived query** — `findByCode(String code)`. Spring Data generates the query from the method name; no SQL or JPQL is written anywhere.
-2. **Named query** — `findExhausted()`. The query itself (`SELECT c FROM Coupon c WHERE c.redemptionCount >= c.maxRedemptions`) is declared once, with `@NamedQuery`, directly on the `Coupon` entity. The repository method has no `@Query` annotation at all — Spring Data finds `Coupon.findExhausted` automatically because the method name matches the query name exactly.
-3. **Native query + projection** — `findRedemptionSummaries()`. A raw SQL `LEFT JOIN` between `coupons` and `redemptions`, grouped by coupon, mapped onto the `CouponRedemptionSummary` projection interface. It returns, per coupon, both `redemptionCount` (the in-memory counter) and `actualRedemptionRows` (a real `COUNT` of persisted `Redemption` rows) side by side — the query that would catch it if the two ever drifted apart. This is the one query here that a derived method or JPQL couldn't express as directly, so it's native by necessity, not by choice.
+2. **Named queries** — `findExhausted()` and `findNearExhaustion(int threshold)`. Both queries are declared once, with two `@NamedQuery` annotations (repeatable since Jakarta Persistence 2.2, no wrapping `@NamedQueries` needed), directly on the `Coupon` entity. Neither repository method has a `@Query` annotation — Spring Data finds `Coupon.findExhausted`/`Coupon.findNearExhaustion` automatically because each method name matches its query name exactly. `findExhausted` mirrors `Coupon.isExhausted()`'s own rule (`redemptionCount >= maxRedemptions`) as a query; `findNearExhaustion` is the one an ops alert would run — coupons with `threshold` or fewer redemptions left, excluding coupons born already exhausted with a limit of `0`.
+3. **Native query + projection** — `findRedemptionSummaries()`. A raw SQL `LEFT JOIN` between `coupons` and `redemptions`, grouped by coupon, mapped onto the `CouponRedemptionSummary` projection interface. It returns, per coupon, both `redemptionCount` (the in-memory counter) and `actualRedemptionRows` (a real `COUNT` of persisted `Redemption` rows) side by side — the query that would catch it if the two ever drifted apart. This is native by necessity: `Coupon` holds no `@OneToMany` back to `Redemption` for JPQL to `COUNT()` over.
 
-`RedemptionRepository` is smaller, and supports auditing rather than being the star of the show:
+`RedemptionRepository` supports the audit trail rather than being the star of the show, but uses all three techniques too:
 
-- `findByCouponIdOrderByRedeemedAtAsc(Long couponId)` — every redemption for a coupon, oldest first.
-- `countByCouponId(Long couponId)` — the literal "running count" the whole domain is about, expressed as a query: the number of `Redemption` rows that actually exist for a coupon, which should always equal `Coupon.redemptionCount`.
+- **Derived** — `findByCouponIdOrderByRedeemedAtAsc(Long couponId)` (every redemption for a coupon, oldest first) and `countByCouponId(Long couponId)` — the literal "running count" the whole domain is about, expressed as a query: the number of `Redemption` rows that actually exist for a coupon, which should always equal `Coupon.redemptionCount`.
+- **Named** — `findRecentForCoupon(Long couponId)`, resolving `Redemption.findRecentForCoupon` (newest redemptions first), declared with `@NamedQuery` on `Redemption` and traversing the `r.coupon.id` association path in JPQL.
+- **Native** — `findDailyRedemptionCounts(Long couponId)`, bucketing one coupon's redemptions by calendar day with PostgreSQL's `date_trunc` function — native by necessity, since neither the function nor the day-bucket aggregate has a JPQL equivalent — mapped onto the `DailyRedemptionCount` projection.
 
 ### Schema (`src/main/resources/db/migration/`)
 
@@ -97,7 +102,7 @@ Swagger UI would be reachable at `http://localhost:8080/swagger-ui.html` once a 
 
 Everything below needs a real (or embedded) database, which makes it an *integration* test, not a unit test — deliberately out of scope for this layer, and left for a later, progressive step:
 
-- Whether `CouponRepository.findByCode`, `findExhausted`, and `findRedemptionSummaries` actually return correct results against real rows (`@DataJpaTest` or Testcontainers).
+- Whether any of the six repository query methods (see [`docs/queries.md`](docs/queries.md)) — derived, named, or native — actually return correct results against real rows (`@DataJpaTest` or Testcontainers).
 - Whether `chk_coupons_redemption_count_within_limit` really rejects an attempt to persist a `redemption_count` above `max_redemptions` at the database level.
 - Whether `Coupon.redeem()`'s check-then-increment is safe under *concurrent* writes to the same row — this layer's tests are all single-threaded, sequential calls to one in-memory object. Two requests racing to redeem the last remaining use of the same coupon is a real bug class (a classic TOCTOU/lost-update problem) that needs either a database-level guard (e.g. optimistic locking with `@Version`, or `SELECT ... FOR UPDATE`) and a genuinely concurrent test to prove it — both are explicitly future work, not covered by anything in this repository yet.
 - End-to-end wiring through a real Spring context (`@SpringBootTest`) — nothing here proves the entities, repositories, and Flyway migrations actually agree with each other outside of `ddl-auto: validate` catching gross mismatches at startup.
@@ -114,12 +119,17 @@ src/main/java/com/couponredemption/
     Redemption.java                         the audit trail of one successful redemption
   repository/
     CouponRepository.java                   derived / named / native query techniques
-    RedemptionRepository.java               derived queries supporting the audit trail
+    RedemptionRepository.java               derived / named / native queries supporting the audit trail
     CouponRedemptionSummary.java            projection for the native summary query
+    DailyRedemptionCount.java               projection for the native daily-bucket query
 src/main/resources/
   application.yml                           datasource + JPA config used when actually running the app
   db/migration/V1__init_schema.sql          schema, foreign key, and the boundary CHECK constraints
 src/test/java/com/couponredemption/domain/
   CouponTest.java                           the boundary precision tests
   RedemptionTest.java                       audit-trail construction and equality tests
+docs/
+  erd.md                                    entity-relationship diagram and table-by-table notes
+  uml.md                                    class diagram, repository interfaces, and design rationale
+  queries.md                                every named/native query explained, with the JPQL/SQL inline
 ```
