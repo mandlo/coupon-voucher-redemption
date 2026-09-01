@@ -1,8 +1,8 @@
-# Coupon/Voucher Redemption — Persistence Layer
+# Coupon/Voucher Redemption — Persistence & Service Layers
 
 A coupon/voucher redemption system built with **Java 21**, **Spring Boot 3**, **Maven**, **PostgreSQL**, and **springdoc-openapi (Swagger)**.
 
-This repository contains **only the persistence layer** (JPA entities, Spring Data repositories, Flyway schema migrations), covered by **unit tests only**. There is no service layer and no REST API yet — those are later, progressive steps.
+This repository contains the **persistence layer** (JPA entities, Spring Data repositories, Flyway schema migrations) and, on top of it, the **service layer** (`CouponService`, orchestrating the redeem-a-coupon operation and its custom exceptions), covered by **unit tests only**. There is no REST API yet — that's a later, progressive step.
 
 ## Why this domain
 
@@ -44,7 +44,7 @@ So even if some future code path forgot to call `Coupon.redeem()` and tried to w
 
 **`Redemption`** is the audit trail, and deliberately does *less*:
 
-- It records the fact that a redemption happened — which coupon, who redeemed it, when — and nothing about whether it *should* have happened. That decision belongs entirely to `Coupon.redeem()`. A later service layer is what will call `coupon.redeem()` and then save a `Redemption` as one transaction; this layer only models the two things being stored, not how they're wired together.
+- It records the fact that a redemption happened — which coupon, who redeemed it, when — and nothing about whether it *should* have happened. That decision belongs entirely to `Coupon.redeem()`. `CouponService.redeemCoupon` (see [Service layer](#service-layer-service) below) is what actually calls `coupon.redeem()` and then saves a `Redemption`, as one transaction; this entity itself still only models the fact being stored, not the orchestration.
 - `redeemedAt` is stamped with `Instant.now()` **inside the constructor**, not via Hibernate's `@CreationTimestamp`. That's a direct consequence of "unit tests only": `@CreationTimestamp` only populates a field when Hibernate actually persists the entity, which means testing it would require a database. Stamping the timestamp in plain Java means `new Redemption(coupon, "someone@example.com")` has a real, assertable `redeemedAt` with no database and no mocking involved.
 - Like `Loan` in an earlier lesson in this series, `Redemption` does **not** override `equals()`/`hashCode()`. There's no natural single-field business key for "one redemption event" — two redemptions of the same coupon by the same person a second apart are two different, real events, not duplicates — so it falls back to identity equality, which is exactly what the tests assert (`equals_fallsBackToIdentity`).
 
@@ -70,14 +70,26 @@ Flyway owns the schema — `spring.jpa.hibernate.ddl-auto` is set to `validate` 
 
 `V1__init_schema.sql` creates both tables, a foreign key from `redemptions.coupon_id` to `coupons.id`, an index on that foreign key, and three `CHECK` constraints: `max_redemptions >= 0`, `redemption_count >= 0`, and — the important one — `redemption_count <= max_redemptions`, the database's own copy of the invariant `Coupon.redeem()` enforces in Java.
 
+### Service layer (`service/`)
+
+One `@Service`, `CouponService`, taking `CouponRepository` and `RedemptionRepository` through the constructor rather than field injection — which is what makes it trivial to unit test with plain Mockito mocks and no Spring context.
+
+- **Class-level `@Transactional(readOnly = true)`, method-level `@Transactional` override** — the service is read-only by default; the two methods that actually mutate state (`createCoupon`, `redeemCoupon`) opt back into a writable transaction individually.
+- **`redeemCoupon(code, redeemedBy)` is the whole point of this layer.** It looks the coupon up, calls `coupon.redeem()`, and — only if that didn't throw — saves the coupon's new count and a new `Redemption` audit row, in that order, as one transaction. The method makes **no attempt to catch or translate `CouponExhaustedException`** — it propagates unchanged, exactly like a direct call to `Coupon.redeem()` would, so a failed redemption leaves both repositories untouched. This is the same "no partial write" guarantee `Coupon.redeem()` already gives at the domain layer, now proven to hold at the service layer too (`CouponServiceTest.redeemCoupon_exactBoundary_persistsExactlyNTimes` asserts exactly N `save()` calls on each repository, never N+1).
+- **Custom unchecked exceptions, one per failure case** (`service/exception/`) — `CouponNotFoundException` and `DuplicateCouponCodeException`. Each has a private constructor and a named static factory (`CouponNotFoundException.forCode(code)`) instead of a public constructor, so every call site reads as a sentence and it's impossible to construct one with the wrong argument in the wrong place.
+- **`createCoupon` fails fast** — it checks for a duplicate code *before* constructing the new `Coupon`, so a taken code never reaches a save call. `CouponServiceTest` asserts this directly (`verify(couponRepository, never()).save(any())` on the duplicate-code test), not just the exception type.
+- **`getCoupon` and `getRedemptionHistory`** are the read side: both look the coupon up by code (throwing `CouponNotFoundException` if it doesn't exist) before doing anything else, and `getRedemptionHistory` then delegates straight to `RedemptionRepository.findByCouponIdOrderByRedeemedAtAsc` — no extra logic of its own.
+
 ## Testing approach
 
-**Unit tests only, as requested.** Both test classes live in `src/test/java/.../domain/`, use plain JUnit 5 + AssertJ, and never touch Spring or a database:
+**Unit tests only, as requested.** Two kinds live side by side, but neither ever touches Spring or a real database:
 
-- **`CouponTest`** is where the boundary precision lives. The central test, `redeem_succeedsExactlyNTimesThenFails`, is a `@ParameterizedTest` run against several values of N (1, 2, 5, 10): it calls `redeem()` exactly N times, asserting the count and the remaining-redemptions figure after *every single call* (not just at the end), then asserts the `(N+1)`th call throws `CouponExhaustedException` **and** that the count afterward is still exactly N — proving the rejected write had no side effect. A second test (`redeem_repeatedFailuresPastExhaustion_countNeverMoves`) hammers an exhausted coupon five more times to check the count really is stuck, not just correct on the first failure. Construction validation (blank/null code, negative limit, the zero-limit edge case) and code-based equality round out the class, along with four tests for `isNearExhaustion(threshold)` — the pure-Java mirror of the `Coupon.findNearExhaustion` named query, added specifically so that query's predicate has something unit-testable behind it (see [`docs/queries.md`](docs/queries.md#tests-added-for-this-change)).
-- **`RedemptionTest`** checks construction validation (null coupon, blank/null `redeemedBy`), that `redeemedAt` is stamped to "now" without needing a database, that `redeemedBy` is trimmed, and that two separately-constructed redemptions for the same coupon and person are *not* equal — confirming the deliberate fall-back to identity equality.
+- **`src/test/java/.../domain/`** — plain JUnit 5 + AssertJ, no mocks needed because the entities have no collaborators.
+  - **`CouponTest`** is where the boundary precision lives. The central test, `redeem_succeedsExactlyNTimesThenFails`, is a `@ParameterizedTest` run against several values of N (1, 2, 5, 10): it calls `redeem()` exactly N times, asserting the count and the remaining-redemptions figure after *every single call* (not just at the end), then asserts the `(N+1)`th call throws `CouponExhaustedException` **and** that the count afterward is still exactly N — proving the rejected write had no side effect. A second test (`redeem_repeatedFailuresPastExhaustion_countNeverMoves`) hammers an exhausted coupon five more times to check the count really is stuck, not just correct on the first failure. Construction validation (blank/null code, negative limit, the zero-limit edge case) and code-based equality round out the class, along with four tests for `isNearExhaustion(threshold)` — the pure-Java mirror of the `Coupon.findNearExhaustion` named query, added specifically so that query's predicate has something unit-testable behind it (see [`docs/queries.md`](docs/queries.md#tests-added-for-this-change)).
+  - **`RedemptionTest`** checks construction validation (null coupon, blank/null `redeemedBy`), that `redeemedAt` is stamped to "now" without needing a database, that `redeemedBy` is trimmed, and that two separately-constructed redemptions for the same coupon and person are *not* equal — confirming the deliberate fall-back to identity equality.
+- **`src/test/java/.../service/`** — `CouponServiceTest`, using `@ExtendWith(MockitoExtension.class)` with `@Mock` repositories and the service constructed by hand in `@BeforeEach`. `Coupon` itself is used as a **real object**, never a mock, wherever `redeem()`'s actual behavior matters — mocking it would only prove the test calls a stub, not that the service wires the real domain logic together correctly. It covers every method: `createCoupon` (saves when free, rejects a duplicate code without saving), `getCoupon`/`getRedemptionHistory` (found vs. `CouponNotFoundException`), and `redeemCoupon` — success (count increments, both repositories saved), an unknown code, an already-exhausted coupon (`CouponExhaustedException`, **zero** saves on either repository), and a `@ParameterizedTest` boundary test (N = 1, 3, 5) asserting `save()` is called on each repository *exactly* N times, never N+1 — the service-layer proof of the same guarantee `CouponTest` already proves at the domain layer.
 
-Both classes run in milliseconds, with no Spring context and no database. Run them with:
+Every test runs in milliseconds, with no Spring context and no database. Run them with:
 
 ```bash
 mvn test
@@ -104,8 +116,8 @@ Everything below needs a real (or embedded) database, which makes it an *integra
 
 - Whether any of the six repository query methods (see [`docs/queries.md`](docs/queries.md)) — derived, named, or native — actually return correct results against real rows (`@DataJpaTest` or Testcontainers).
 - Whether `chk_coupons_redemption_count_within_limit` really rejects an attempt to persist a `redemption_count` above `max_redemptions` at the database level.
-- Whether `Coupon.redeem()`'s check-then-increment is safe under *concurrent* writes to the same row — this layer's tests are all single-threaded, sequential calls to one in-memory object. Two requests racing to redeem the last remaining use of the same coupon is a real bug class (a classic TOCTOU/lost-update problem) that needs either a database-level guard (e.g. optimistic locking with `@Version`, or `SELECT ... FOR UPDATE`) and a genuinely concurrent test to prove it — both are explicitly future work, not covered by anything in this repository yet.
-- End-to-end wiring through a real Spring context (`@SpringBootTest`) — nothing here proves the entities, repositories, and Flyway migrations actually agree with each other outside of `ddl-auto: validate` catching gross mismatches at startup.
+- Whether `Coupon.redeem()`'s check-then-increment — and `CouponService.redeemCoupon`'s look-up-then-`redeem()`-then-save on top of it — is safe under *concurrent* writes to the same row. Every test at both layers is single-threaded, sequential calls to one in-memory object standing in for one database row. Two requests racing to redeem the last remaining use of the same coupon is a real bug class (a classic TOCTOU/lost-update problem) that needs either a database-level guard (e.g. optimistic locking with `@Version`, or `SELECT ... FOR UPDATE`) and a genuinely concurrent test to prove it — both are explicitly future work, not covered by anything in this repository yet.
+- End-to-end wiring through a real Spring context (`@SpringBootTest`) — nothing here proves the entities, repositories, Flyway migrations, and `CouponService`'s `@Transactional` boundaries actually agree with each other at runtime, outside of `ddl-auto: validate` catching gross entity/schema mismatches at startup.
 
 ## Project layout
 
@@ -122,12 +134,20 @@ src/main/java/com/couponredemption/
     RedemptionRepository.java               derived / named / native queries supporting the audit trail
     CouponRedemptionSummary.java            projection for the native summary query
     DailyRedemptionCount.java               projection for the native daily-bucket query
+  service/
+    CouponService.java                      redeemCoupon orchestration + createCoupon/getCoupon/getRedemptionHistory
+    exception/
+      CouponNotFoundException.java          thrown when a coupon code has no matching row
+      DuplicateCouponCodeException.java     thrown when createCoupon is called with a taken code
 src/main/resources/
   application.yml                           datasource + JPA config used when actually running the app
   db/migration/V1__init_schema.sql          schema, foreign key, and the boundary CHECK constraints
-src/test/java/com/couponredemption/domain/
-  CouponTest.java                           the boundary precision tests
-  RedemptionTest.java                       audit-trail construction and equality tests
+src/test/java/com/couponredemption/
+  domain/
+    CouponTest.java                         the boundary precision tests
+    RedemptionTest.java                     audit-trail construction and equality tests
+  service/
+    CouponServiceTest.java                  Mockito unit tests for every CouponService method
 docs/
   erd.md                                    entity-relationship diagram and table-by-table notes
   uml.md                                    class diagram, repository interfaces, and design rationale
