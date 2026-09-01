@@ -7,6 +7,7 @@ import com.couponredemption.repository.CouponRepository;
 import com.couponredemption.repository.RedemptionRepository;
 import com.couponredemption.service.exception.CouponNotFoundException;
 import com.couponredemption.service.exception.DuplicateCouponCodeException;
+import com.couponredemption.service.exception.InvalidRedeemerException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -171,6 +172,50 @@ class CouponServiceTest {
         // on either repository.
         verify(couponRepository, times(maxRedemptions)).save(coupon);
         verify(redemptionRepository, times(maxRedemptions)).save(any(Redemption.class));
+    }
+
+    // --- redeemCoupon: redeemedBy must look like an email address ---------
+
+    @ParameterizedTest
+    // @ValueSource feeds this same test method once per string in the list -
+    // one test *method*, four test *runs*, each shown separately in the
+    // results. This avoids writing four almost-identical methods that only
+    // differ in the input string.
+    @ValueSource(strings = {"not-an-email", "missing-at-sign.com", "double@@example.com", "trailing-dot@example."})
+    @DisplayName("redeemCoupon rejects a redeemedBy value that isn't shaped like an email, before touching any repository")
+    void redeemCoupon_throwsInvalidRedeemerException_whenRedeemedByIsMalformed(String malformedRedeemedBy) {
+        // No `when(...)` stubbing at all in this test - and that's the point.
+        // If the code under test tried to call couponRepository.findByCode(...)
+        // before the format check, Mockito's mock would just return null
+        // (the default for an unstubbed method), which would then blow up
+        // with a NullPointerException instead of the exception we expect.
+        // A passing test here is proof the repository was never reached.
+        assertThatThrownBy(() -> couponService.redeemCoupon(CODE, malformedRedeemedBy))
+                .isInstanceOf(InvalidRedeemerException.class)
+                .hasMessageContaining(malformedRedeemedBy);
+
+        verify(couponRepository, never()).findByCode(any());
+        verify(couponRepository, never()).save(any());
+        verify(redemptionRepository, never()).save(any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "   "})
+    @DisplayName("redeemCoupon rejects a blank redeemedBy value")
+    void redeemCoupon_throwsInvalidRedeemerException_whenRedeemedByIsBlank(String blankRedeemedBy) {
+        assertThatThrownBy(() -> couponService.redeemCoupon(CODE, blankRedeemedBy))
+                .isInstanceOf(InvalidRedeemerException.class);
+    }
+
+    @Test
+    @DisplayName("redeemCoupon rejects a null redeemedBy value instead of throwing NullPointerException")
+    void redeemCoupon_throwsInvalidRedeemerException_whenRedeemedByIsNull() {
+        // This is the test that specifically proves the `redeemedBy == null`
+        // check (and its position on the LEFT of the `||`) does its job:
+        // without it, EMAIL_PATTERN.matcher(null) would throw a
+        // NullPointerException instead of the intended InvalidRedeemerException.
+        assertThatThrownBy(() -> couponService.redeemCoupon(CODE, null))
+                .isInstanceOf(InvalidRedeemerException.class);
     }
 
     // --- getRedemptionHistory ------------------------------------------
