@@ -110,6 +110,50 @@ class CouponTest {
         assertThat(coupon.getRedemptionCount()).isEqualTo(3);
     }
 
+    // --- isNearExhaustion(): the Java mirror of Coupon.findNearExhaustion -
+
+    @Test
+    @DisplayName("isNearExhaustion is false while more redemptions remain than the threshold")
+    void isNearExhaustion_falseWhenPlentyRemaining() {
+        Coupon coupon = new Coupon("SUMMER10", 10);
+        coupon.redeem(); // remaining = 9
+
+        assertThat(coupon.isNearExhaustion(1)).isFalse();
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, 2, 3})
+    @DisplayName("isNearExhaustion is true once remaining redemptions drop to or below the threshold")
+    void isNearExhaustion_trueAtOrBelowThreshold(int threshold) {
+        Coupon coupon = new Coupon("SUMMER10", 5);
+        for (int i = 0; i < 4; i++) {
+            coupon.redeem();
+        }
+
+        assertThat(coupon.remainingRedemptions()).isEqualTo(1);
+        assertThat(coupon.isNearExhaustion(threshold)).isTrue();
+    }
+
+    @Test
+    @DisplayName("isNearExhaustion flips from false to true exactly at the threshold, not before")
+    void isNearExhaustion_boundaryIsInclusive() {
+        Coupon coupon = new Coupon("SUMMER10", 5);
+        coupon.redeem(); // remaining = 4
+
+        assertThat(coupon.isNearExhaustion(3)).as("4 remaining <= 3").isFalse();
+        assertThat(coupon.isNearExhaustion(4)).as("4 remaining <= 4").isTrue();
+    }
+
+    @Test
+    @DisplayName("a coupon born with a limit of zero is exhausted, not near-exhaustion")
+    void isNearExhaustion_excludesZeroLimitCoupon() {
+        Coupon coupon = new Coupon("SUMMER10", 0);
+
+        assertThat(coupon.isExhausted()).isTrue();
+        assertThat(coupon.isNearExhaustion(0)).isFalse();
+        assertThat(coupon.isNearExhaustion(100)).isFalse();
+    }
+
     // --- equality: business key is the code -------------------------------
 
     @Test

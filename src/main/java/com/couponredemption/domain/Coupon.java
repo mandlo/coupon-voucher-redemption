@@ -41,9 +41,11 @@ import java.util.Objects;
         // Coupons that still work, but have :threshold or fewer redemptions
         // left - the query an ops dashboard or alert would run to catch a
         // popular coupon about to run out before customers start hitting
-        // CouponExhaustedException. "maxRedemptions - redemptionCount" is
-        // ordinary arithmetic on two entity fields, which is exactly the
-        // kind of expression JPQL was designed to read naturally.
+        // CouponExhaustedException. This WHERE clause is deliberately the
+        // same predicate as isNearExhaustion(int) below, restated in JPQL so
+        // it can run across every row in the database instead of after
+        // loading every coupon into Java - see the method's Javadoc for why
+        // both copies exist.
         name = "Coupon.findNearExhaustion",
         query = "SELECT c FROM Coupon c WHERE (c.maxRedemptions - c.redemptionCount) <= :threshold "
                 + "AND c.maxRedemptions > 0 ORDER BY (c.maxRedemptions - c.redemptionCount) ASC"
@@ -94,6 +96,29 @@ public class Coupon {
 
     public boolean isExhausted() {
         return redemptionCount >= maxRedemptions;
+    }
+
+    /**
+     * True if this coupon still works but has {@code threshold} or fewer
+     * redemptions left - the same "about to run out" question
+     * {@code Coupon.findNearExhaustion} answers as a database query.
+     * <p>
+     * This method exists so that predicate has a pure-Java copy that can be
+     * unit tested directly, with no database: a repository query method has
+     * no logic of its own to unit test (the "logic" is the JPQL string
+     * itself, which only a real query execution can verify - see
+     * {@code docs/queries.md}), but this mirrored predicate does. Keeping
+     * both in sync is a manual discipline, not something either language
+     * enforces - if this method's condition ever changes, the JPQL in
+     * {@code Coupon.findNearExhaustion} needs the same change alongside it.
+     * <p>
+     * A coupon born with a limit of {@code 0} is excluded on purpose: it's
+     * already exhausted, not "running low," so it isn't near-exhaustion,
+     * it's just exhaustion - {@link #isExhausted()} is the right check for
+     * that case instead.
+     */
+    public boolean isNearExhaustion(int threshold) {
+        return maxRedemptions > 0 && remainingRedemptions() <= threshold;
     }
 
     /**
