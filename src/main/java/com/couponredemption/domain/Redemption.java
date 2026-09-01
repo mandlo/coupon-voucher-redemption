@@ -8,6 +8,7 @@ import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
+import jakarta.persistence.NamedQuery;
 import jakarta.persistence.Table;
 
 import java.time.Instant;
@@ -36,6 +37,14 @@ import java.time.Instant;
  */
 @Entity
 @Table(name = "redemptions")
+@NamedQuery(
+        // "This coupon's history, newest first" - the JPQL traverses the
+        // coupon.id path (Redemption -> Coupon) the same way a getter would,
+        // because the @ManyToOne association is a real Java field on this
+        // entity, not just a foreign-key column.
+        name = "Redemption.findRecentForCoupon",
+        query = "SELECT r FROM Redemption r WHERE r.coupon.id = :couponId ORDER BY r.redeemedAt DESC"
+)
 public class Redemption {
 
     @Id
